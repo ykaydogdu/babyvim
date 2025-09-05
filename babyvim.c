@@ -4,7 +4,6 @@
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 
-#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,7 +182,6 @@ void editorOpen(char *filename) {
     char *line = NULL;
     size_t linecap = 0;
     ssize_t linelen;
-    linelen = getline(&line, &linecap, fp);
     while ((linelen = getline(&line, &linecap, fp)) != -1) {
         while (linelen > 0 && (line[linelen - 1] == '\n' ||
                                line[linelen - 1] == '\r'))
@@ -276,17 +274,18 @@ void editorRefreshScreen() {
 
     struct abuf ab = ABUF_INIT;
 
-    abAppend(&ab, "\x1b[?25l", 6);
-    abAppend(&ab, "\x1b[H", 3);
+    abAppend(&ab, "\x1b[?25l", 6); // Hide cursor
+    abAppend(&ab, "\x1b[H", 3); // Move cursor to top-left corner
     
     editorDrawRows(&ab);
 
     char buf[32];
+    // Move cursor to the current position
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
                                                                 (E.cx - E.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
-    abAppend(&ab, "\x1b[?25h", 6);
+    abAppend(&ab, "\x1b[?25h", 6); // Show cursor
 
     write(STDOUT_FILENO, ab.b, ab.len);
     abFree(&ab);

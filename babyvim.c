@@ -182,13 +182,26 @@ int getWindowSize(int *rows, int *cols) {
 
 /*** row operations ***/
 
-int editorRowCxtoRx(erow *row, int cx) {
+int editorRowCxToRx(erow *row, int cx) {
     int rx = 0;
     for (int j = 0; j < cx; j++) {
         if (row->chars[j] == '\t') rx += (BABYVIM_TAB_STOP - 1) - (rx % BABYVIM_TAB_STOP);
         rx++;
     }
     return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx) {
+    int cur_rx = 0;
+    int cx = 0;
+    for (cx = 0; cx < row->size; cx++) {
+        if (row->chars[cx] == '\t')
+            cur_rx += (BABYVIM_TAB_STOP - 1) - (cur_rx % BABYVIM_TAB_STOP);
+        cur_rx++;
+
+        if (cur_rx > rx) break;
+    } 
+    return cx;
 }
 
 void editorUpdateRow(erow *row) {
@@ -387,7 +400,18 @@ void editorFind() {
     char *query = editorPrompt("Search: %s (ESC to cancel)");
     if (query == NULL) return;
     
-    int i;
+    for (int i = 0; i < E.numrows; i++) {
+        erow *row = &E.row[i];
+        char *match = strstr(row->render, query);
+        if (match) {
+            E.cy = i;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            E.rowoff = E.numrows;
+            break;
+        }
+    }
+
+    free(query);
 }
 
 /*** append buffer ***/
@@ -416,7 +440,7 @@ void abFree(struct abuf *ab) {
 
 void editorScroll() {
     E.rx = 0;
-    if (E.cy < E.numrows) E.rx = editorRowCxtoRx(&E.row[E.cy], E.cx);
+    if (E.cy < E.numrows) E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
 
     if (E.cy < E.rowoff) {
         E.rowoff = E.cy;
@@ -628,6 +652,10 @@ void editorProcessKeypress() {
             editorSave();
             break;
 
+        case CTRL_KEY('f'):
+            editorFind();
+            break;
+
         case ARROW_UP:
         case ARROW_DOWN:
         case ARROW_LEFT:
@@ -703,7 +731,7 @@ int main(int argc, char *argv[]) {
         editorOpen(argv[1]);
     }
 
-    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     while (1) {
         editorRefreshScreen();

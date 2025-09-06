@@ -1,11 +1,11 @@
 /*** includes ***/
 
-#include <ctype.h>
-#include <stdarg.h>
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 
+#include <ctype.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -69,7 +69,7 @@ struct editorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 /*** terminal ***/
 
@@ -367,7 +367,7 @@ void editorOpen(char *filename) {
 
 void editorSave() {
     if (E.filename == NULL) {
-        E.filename = editorPrompt("Save as: %s (ESC to cancel)");
+        E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
         if (E.filename == NULL) {
             editorSetStatusMessage("Save aborted");
             return;
@@ -396,22 +396,61 @@ void editorSave() {
 
 /*** find ***/
 
-void editorFind() {
-    char *query = editorPrompt("Search: %s (ESC to cancel)");
-    if (query == NULL) return;
-    
+void editorFindCallback(char *query, int key) {
+    static int last_match = -1;
+    static int direction = 1;
+
+    if (key == '\r' || key == '\x1b') {
+        last_match = -1;
+        direction = 1;
+        return;
+    } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+        direction = 1;
+    } else if (key == ARROW_LEFT || key == ARROW_UP) {
+        direction = -1;
+    } else {
+        last_match = -1;
+        direction = 1;
+    }
+
+    if (last_match == -1) direction = 1;
+    int current = last_match;
+
+
     for (int i = 0; i < E.numrows; i++) {
-        erow *row = &E.row[i];
+        current += direction;
+        if (current == -1) current = E.numrows - 1;
+        else if (current == E.numrows) current = 0;
+        
+        erow *row = &E.row[current];
         char *match = strstr(row->render, query);
         if (match) {
-            E.cy = i;
+            last_match = current;
+            E.cy = current;
             E.cx = editorRowRxToCx(row, match - row->render);
             E.rowoff = E.numrows;
             break;
         }
     }
+}
 
-    free(query);
+void editorFind() {
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.coloff;
+    int saved_rowoff = E.rowoff;
+
+    char *query = editorPrompt("Search: %s (Use ESC/Arrows/Enter)",
+                             editorFindCallback);
+    
+    if (query) {
+        free(query);
+    } else {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff;
+    }
 }
 
 /*** append buffer ***/
@@ -558,7 +597,7 @@ void editorSetStatusMessage(const char *fmt, ...) {
 
 /*** input ***/
 
-char *editorPrompt(char *prompt) {
+char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     size_t bufsize = 128;
     char *buf = malloc(bufsize);
 
@@ -574,11 +613,13 @@ char *editorPrompt(char *prompt) {
             if (buflen != 0) buf[--buflen] = '\0';
         } else if (c == '\x1b') {
             editorSetStatusMessage("");
+            if (callback) callback(buf, c);
             free(buf);
             return NULL;
         } else if (c == '\r') {
             if (buflen != 0) {
                 editorSetStatusMessage("");
+                if (callback) callback(buf, buflen);
                 return buf;
             }
         } else if (!iscntrl(c) && c < 128) {
@@ -589,6 +630,8 @@ char *editorPrompt(char *prompt) {
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+
+        if (callback) callback(buf, c);
     }
 }
 

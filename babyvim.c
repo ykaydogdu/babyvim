@@ -70,6 +70,7 @@ typedef struct erow {
     int idx;
     int size;
     int rsize;
+    int indent;
     char *chars;
     char *render;
     unsigned char *hl;
@@ -469,15 +470,27 @@ int editorRowRxToCx(erow *row, int rx) {
 }
 
 void editorUpdateRow(erow *row) {
+    int j;
+
+    int indent = 0;
     int tabs = 0;
-    for (int j = 0; j < row->size; j++)
+    for (j = 0; j < row->size; j++) {
+        if (row->chars[j] == '\t') {
+            tabs++;
+            indent += BABYVIM_TAB_STOP;
+        } else if (row->chars[j] == ' ') indent++;
+        else break;
+    }
+    row->indent = indent;
+
+    for (; j < row->size; j++)
         if (row->chars[j] == '\t') tabs++;
 
     free(row->render);
     row->render = malloc(row->size + tabs * (BABYVIM_TAB_STOP - 1) + 1);
 
     int idx = 0;
-    for (int j = 0; j < row->size; j++) {
+    for (j = 0; j < row->size; j++) {
         if (row->chars[j] == '\t') {
             row->render[idx++] = ' ';
             while (idx % BABYVIM_TAB_STOP != 0) row->render[idx++] = ' ';
@@ -499,14 +512,14 @@ void editorInsertRow(int at, char *s, size_t len) {
     for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++; // increment all the row indices after the inserted row
 
     E.row[at].idx = at;
-    
     E.row[at].size = len;
     E.row[at].chars = malloc(len + 1);
-    
+
     memcpy(E.row[at].chars, s, len);
     E.row[at].chars[len] = '\0';
     
     E.row[at].rsize = 0;
+    E.row[at].indent = 0;
     E.row[at].render = NULL;
     E.row[at].hl = NULL;
     E.row[at].hl_open_comment = 0;
@@ -530,6 +543,17 @@ void editorDelRow(int at) {
     for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--; // decrement all the row indices after the deleted row
     E.numrows--;
     E.dirty++;
+}
+
+void editorIndentRow(erow *row, int indent) {
+    char *new = malloc(row->size + indent + 1);
+    memset(new, ' ', indent);
+    memcpy(&new[indent], row->chars, row->size);
+    new[row->size + indent] = '\0';
+    free(row->chars);
+    row->chars = new;
+    row->size += indent;
+    editorUpdateRow(row);
 }
 
 void editorRowInsertChar(erow *row, int at, int c) {
@@ -584,6 +608,7 @@ void editorInsertChar(int c) {
 void editorInsertNewline() {
     if (E.cx == 0) {
         editorInsertRow(E.cy, "", 0);
+        E.cx = 0;
     } else {
         erow *row = &E.row[E.cy];
         editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
@@ -591,9 +616,11 @@ void editorInsertNewline() {
         row->size = E.cx;
         row->chars[row->size] = '\0';
         editorUpdateRow(row); // editorInsertRow calls editorUpdateRow for the new row
+
+        editorIndentRow(&E.row[E.cy + 1], row->indent);
+        E.cx = row->indent;
     }
     E.cy++;
-    E.cx = 0;
 }
 
 void editorDelChar() {

@@ -20,8 +20,10 @@
 /*** defines ***/
 
 #define BABYVIM_VERSION "0.0.1"
-#define BABYVIM_TAB_STOP 8
+#define BABYVIM_SPACE_TYPE 1 // 0: tabs, 1: spaces
+#define BABYVIM_TAB_STOP 4
 #define BABYVIM_QUIT_TIMES 3
+#define BABYVIM_WRAP_LINES 0 // 0: no wrap, 1: hard wrap, 2: soft wrap
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -82,6 +84,7 @@ struct editorConfig {
     int screenrows;
     int screencols;
     int numrows;
+    int linenumwidth;
     erow *row;
     int dirty;
     char *filename;
@@ -103,6 +106,15 @@ char *C_HL_keywords[] = {
     "void|", NULL
   };
 
+char *PY_HL_extensions[] = {".py", NULL};
+char *PY_HL_keywords[] = {
+    "if", "else", "elif", "while", "for", "break", "continue", "return", "def",
+    "class", "import", "from", "as", "is", "in", "and", "or", "not", "with",
+    "yield", "lambda", "global", "nonlocal", "raise", "try", "except", "finally",
+    "print|", "input|", "open|", "close|", "read|", "write|", "append|", "seek|", "tell|",
+    "flush|", "truncate|", "copy|", "move|", "rename|", "delete|", "exists|", "list|",
+    "dict|", "set|", "tuple|", NULL
+};
 
 struct editorSyntax HLDB[] = {
     {
@@ -110,6 +122,13 @@ struct editorSyntax HLDB[] = {
         C_HL_extensions,
         C_HL_keywords,
         "//", "/*", "*/",
+        HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
+    },
+    {
+        "python",
+        PY_HL_extensions,
+        PY_HL_keywords,
+        "#", "'''", "'''",
         HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
     },
 };
@@ -121,6 +140,28 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+
+/*** append buffer ***/
+
+struct abuf {
+    char *b;
+    int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+    char *new = realloc(ab->b, ab->len + len);
+
+    if (new == NULL) return;
+    memcpy(&new[ab->len], s, len);
+    ab->b = new;
+    ab->len += len;
+}
+
+void abFree(struct abuf *ab) {
+    free(ab->b);
+}
 
 /*** terminal ***/
 
@@ -198,6 +239,12 @@ int editorReadKey() {
         return '\x1b';
     }
     return c;
+}
+
+void refreshCursorPosition(struct abuf *ab) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowoff + 1, E.rx - E.coloff + E.linenumwidth + 2);
+    abAppend(ab, buf, strlen(buf));
 }
 
 int getCursorPosition(int *rows, int *cols) {
@@ -466,6 +513,7 @@ void editorInsertRow(int at, char *s, size_t len) {
     editorUpdateRow(&E.row[at]);
 
     E.numrows++;
+    E.linenumwidth = snprintf(NULL, 0, "%d", E.numrows);
     E.dirty++;
 }
 
@@ -503,12 +551,26 @@ void editorRowAppendString(erow *row, char *s, size_t len) {
     E.dirty++;
 }
 
-void editorRowDelChar(erow *row, int at) {
-    if (at < 0 || at >= row->size) return;
-    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
-    row->size--;
+int editorRowDelChar(erow *row, int at) {
+    if (at < 0 || at >= row->size) return 0;
+    
+    // detect tab at the beginning of the row
+    int all_spaces = BABYVIM_SPACE_TYPE && at >= BABYVIM_TAB_STOP - 1;
+    int j = at;
+    while (all_spaces && j) {
+        if (row->chars[j] != ' ') {
+            all_spaces = 0;
+        }
+        j--;
+    }
+    int mod = (at + 1) % BABYVIM_TAB_STOP;
+    int del_count = all_spaces ? (mod == 0 ? BABYVIM_TAB_STOP : mod) : 1;
+    
+    memmove(&row->chars[at - del_count + 1], &row->chars[at + 1], row->size - at);
+    row->size -= del_count;
     editorUpdateRow(row);
     E.dirty++;
+    return del_count;
 }
 
 /*** editor operations ***/
@@ -538,8 +600,7 @@ void editorDelChar() {
     if (E.cy == E.numrows) return;
     erow *row = &E.row[E.cy];
     if (E.cx > 0) {
-        editorRowDelChar(row, E.cx - 1);
-        E.cx--;
+        E.cx -= editorRowDelChar(row, E.cx - 1);
     } else {
         if (E.cy == 0) return;
         E.cx = E.row[E.cy - 1].size;
@@ -566,7 +627,6 @@ char *editorRowsToString(int *buflen) {
         *p = '\n';
         p++;
     }
-    *p = '\0';
     return buf;
 }
 
@@ -577,7 +637,10 @@ void editorOpen(char *filename) {
     editorSelectSyntaxHighlight();
 
     FILE *fp = fopen(filename, "r");
-    if (!fp) die("fopen");
+    if (!fp) {
+        E.dirty = 1; // set dirty flag for non-existent file
+        return;
+    }; // if file doesn't exist, just set syntax highlighting and dirty flag
 
     char *line = NULL;
     size_t linecap = 0;
@@ -702,28 +765,6 @@ void editorFind() {
     }
 }
 
-/*** append buffer ***/
-
-struct abuf {
-    char *b;
-    int len;
-};
-
-#define ABUF_INIT {NULL, 0}
-
-void abAppend(struct abuf *ab, const char *s, int len) {
-    char *new = realloc(ab->b, ab->len + len);
-
-    if (new == NULL) return;
-    memcpy(&new[ab->len], s, len);
-    ab->b = new;
-    ab->len += len;
-}
-
-void abFree(struct abuf *ab) {
-    free(ab->b);
-}
-
 /*** output ***/
 
 void editorScroll() {
@@ -759,15 +800,23 @@ void editorDrawRows(struct abuf *ab) {
                 // Center the welcome message
                 int padding = (E.screencols - welcomelen) / 2;
                 if (padding) {
-                    abAppend(ab, "~", 1);
+                    abAppend(ab, "\x1b[90m~", 6);
+                    abAppend(ab, "\x1b[m", 3);
                     padding--;
                 }
                 while (padding--) abAppend(ab, " ", 1);
                 abAppend(ab, welcome, welcomelen);
             } else {
-                abAppend(ab, "~", 1);
+                abAppend(ab, "\x1b[90m~", 6);
+                abAppend(ab, "\x1b[m", 3);
             }
         } else {
+            // Print line number
+            char buf[16];
+            int clen = snprintf(buf, sizeof(buf),
+                           "\x1b[90m%-*d\x1b[m ", E.linenumwidth, filerow + 1);
+            abAppend(ab, buf, clen);
+
             int len = E.row[filerow].rsize - E.coloff;
             if (len < 0) len = 0;
             if (len > E.screencols) len = E.screencols;
@@ -818,8 +867,8 @@ void editorDrawStatusBar(struct abuf *ab) {
     int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
         E.filename ? E.filename : "[No Name]", E.numrows,
         E.dirty ? "(modified)" : "");
-    int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
-        E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d/%d",
+        E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.cx, E.numrows);
 
     if (len > E.screencols) len = E.screencols;
     abAppend(ab, status, len);
@@ -856,11 +905,8 @@ void editorRefreshScreen() {
     editorDrawStatusBar(&ab);
     editorDrawMessageBar(&ab);
 
-    char buf[32];
     // Move cursor to the current position
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-                                                                (E.rx - E.coloff) + 1);
-    abAppend(&ab, buf, strlen(buf));
+    refreshCursorPosition(&ab);
 
     abAppend(&ab, "\x1b[?25h", 6); // Show cursor
 
@@ -960,7 +1006,16 @@ void editorProcessKeypress() {
         case '\r':
             editorInsertNewline();
             break;
-        
+        case '\t':
+            if (BABYVIM_SPACE_TYPE) {
+                int j = BABYVIM_TAB_STOP;
+                while (j--) editorInsertChar(' ');
+                break;
+            } else {
+                editorInsertChar(c);
+                break;
+            }
+    
         case CTRL_KEY('q'):
             if (E.dirty && quit_times > 0) {
                 editorSetStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", quit_times);
@@ -979,6 +1034,7 @@ void editorProcessKeypress() {
         case CTRL_KEY('f'):
             editorFind();
             break;
+
 
         case ARROW_UP:
         case ARROW_DOWN:
@@ -1038,6 +1094,7 @@ void initEditor() {
     E.rowoff = 0;
     E.coloff = 0;
     E.numrows = 0;
+    E.linenumwidth = 0;
     E.row = NULL;
     E.dirty = 0;
     E.filename = NULL;

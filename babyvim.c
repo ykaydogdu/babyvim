@@ -84,6 +84,8 @@ struct editorConfig {
     int coloff;
     int screenrows;
     int screencols;
+    int textrows;
+    int textcols;
     int numrows;
     int linenumwidth;
     erow *row;
@@ -244,7 +246,7 @@ int editorReadKey() {
 
 void refreshCursorPosition(struct abuf *ab) {
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowoff + 1, E.rx - E.coloff + E.linenumwidth + 2);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowoff + 1, E.rx - E.coloff + E.linenumwidth + 1);
     abAppend(ab, buf, strlen(buf));
 }
 
@@ -526,7 +528,11 @@ void editorInsertRow(int at, char *s, size_t len) {
     editorUpdateRow(&E.row[at]);
 
     E.numrows++;
-    E.linenumwidth = snprintf(NULL, 0, "%d", E.numrows);
+    int linenumwidth = snprintf(NULL, 0, "%d", E.numrows) + 1;
+    if (linenumwidth > E.linenumwidth) {
+        E.textcols -= linenumwidth - E.linenumwidth;
+        E.linenumwidth = linenumwidth;
+    }
     E.dirty++;
 }
 
@@ -801,31 +807,31 @@ void editorScroll() {
     if (E.cy < E.rowoff) {
         E.rowoff = E.cy;
     }
-    if (E.cy >= E.rowoff + E.screenrows) {
-        E.rowoff = E.cy - E.screenrows + 1;
+    if (E.cy >= E.rowoff + E.textrows) {
+        E.rowoff = E.cy - E.textrows + 1;
     }
     if (E.rx < E.coloff) {
         E.coloff = E.rx;
     }
-    if (E.rx >= E.coloff + E.screencols) {
-        E.coloff = E.rx - E.screencols + 1;
+    if (E.rx >= E.coloff + E.textcols) {
+        E.coloff = E.rx - E.textcols + 1;
     }
 }
 
 void editorDrawRows(struct abuf *ab) {
-    for (int y = 0; y < E.screenrows; y++) {
+    for (int y = 0; y < E.textrows; y++) {
         int filerow = y + E.rowoff;
         if (filerow >= E.numrows) {
-            if (E.numrows == 0 &&y == E.screenrows / 3) { // print welcome message
+            if (E.numrows == 0 &&y == E.textrows / 3) { // print welcome message
                 char welcome[80];
                 int welcomelen = snprintf(welcome, sizeof(welcome),
                     "Babyvim -- version %s", BABYVIM_VERSION);
 
                 // Handle not enough width
-                if (welcomelen > E.screencols) welcomelen = E.screencols;
+                if (welcomelen > E.textcols) welcomelen = E.textcols;
 
                 // Center the welcome message
-                int padding = (E.screencols - welcomelen) / 2;
+                int padding = (E.textcols - welcomelen) / 2;
                 if (padding) {
                     abAppend(ab, "\x1b[90m~", 6);
                     abAppend(ab, "\x1b[m", 3);
@@ -841,12 +847,12 @@ void editorDrawRows(struct abuf *ab) {
             // Print line number
             char buf[16];
             int clen = snprintf(buf, sizeof(buf),
-                           "\x1b[90m%-*d\x1b[m ", E.linenumwidth, filerow + 1);
+                           "\x1b[90m%-*d\x1b[m", E.linenumwidth, filerow + 1);
             abAppend(ab, buf, clen);
 
             int len = E.row[filerow].rsize - E.coloff;
             if (len < 0) len = 0;
-            if (len > E.screencols) len = E.screencols;
+            if (len > E.textcols) len = E.textcols;
 
             char *c = &E.row[filerow].render[E.coloff];
             unsigned char *hl = &E.row[filerow].hl[E.coloff];
@@ -1121,7 +1127,7 @@ void initEditor() {
     E.rowoff = 0;
     E.coloff = 0;
     E.numrows = 0;
-    E.linenumwidth = 0;
+    E.linenumwidth = 2; // ~ character + space
     E.row = NULL;
     E.dirty = 0;
     E.filename = NULL;
@@ -1130,7 +1136,8 @@ void initEditor() {
     E.syntax = NULL;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
-    E.screenrows -= 2; // for the status line
+    E.textrows = E.screenrows - 2; // for the status line
+    E.textcols = E.screencols - E.linenumwidth; // for the line number area
 }
 
 int main(int argc, char *argv[]) {

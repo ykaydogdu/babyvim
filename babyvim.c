@@ -23,7 +23,7 @@
 #define BABYVIM_SPACE_TYPE 1 // 0: tabs, 1: spaces
 #define BABYVIM_TAB_STOP 4
 #define BABYVIM_QUIT_TIMES 3
-#define BABYVIM_WRAP_LINES 1 // 0: no wrap, 1: hard wrap, 2: soft wrap
+#define BABYVIM_WRAP_LINES 2 // 0: no wrap, 1: hard wrap, 2: soft wrap
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define is_space(c) (c == ' ' || c == '\t')
@@ -250,9 +250,77 @@ int editorReadKey() {
     return c;
 }
 
+/*** row operations ***/
+
+// visual height of a row in wrapped mode
+static inline int rowVisualHeight(erow *row) {
+    if (BABYVIM_WRAP_LINES != 2) return 1;
+    if (!row) return 1;
+    return row->rsize == 0 ? 1 : (row->rsize - 1) / E.textcols + 1;
+}
+
+// which subrow is the cursor inside this row
+static inline int rowSubrowAtRx(erow *row, int rx) {
+    if (BABYVIM_WRAP_LINES != 2) return rx;
+    if (!row) return rx;
+    return rx / E.textcols;
+}
+
+// rx inside the current subrow
+static inline int rowcolInSubrow(erow *row, int rx) {
+    if (BABYVIM_WRAP_LINES != 2) return rx;
+    if (!row) return rx;
+    return rx % E.textcols;
+}
+
+// absolute visual row index of (filerow = r, subrow = s)
+static inline int rowAbsoluteVisualRow(int r, int s) {
+    if (BABYVIM_WRAP_LINES != 2) return r;
+    int v = 0;
+    for (int i = 0; i < r; i++) v += rowVisualHeight(&E.row[i]);
+    return v + s;
+}
+
+static void visualIndexToFile(int vindex, int *outRow, int *outSubrow) {
+    if (BABYVIM_WRAP_LINES != 2) {
+        *outRow = vindex;
+        *outSubrow = 0;
+        return;
+    }
+    int acc = 0;
+    for (int r = 0; r < E.numrows; r++) {
+        int h = rowVisualHeight(&E.row[r]);
+        if (acc + h > vindex) {
+            *outRow = r;
+            *outSubrow = vindex - acc;
+            return;
+        }
+        acc += h;
+    }
+    *outRow = E.numrows > 0 ? E.numrows - 1 : 0; // clamp to last row
+    *outSubrow = 0;
+}
+
 void refreshCursorPosition(struct abuf *ab) {
+    int vrow, vcol;
+    erow *row = E.cy < E.numrows ? &E.row[E.cy] : NULL;
+
+    if (BABYVIM_WRAP_LINES == 2 && row) {
+        int rx = E.rx;
+        int sub = rowSubrowAtRx(row, rx);
+        vrow = rowAbsoluteVisualRow(E.cy, sub);
+        vcol = rowcolInSubrow(row, rx);
+    } else {
+        vrow = E.cy;
+        vcol = E.rx;
+    }
+
+    // final on screen pos
+    int scr_y = vrow - E.rowoff + 1;
+    int scr_x = vcol - E.coloff + E.linenumwidth + 1;
+
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowoff + 1, E.rx - E.coloff + E.linenumwidth + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", scr_y, scr_x);
     abAppend(ab, buf, strlen(buf));
 }
 
@@ -874,24 +942,85 @@ void editorScroll() {
     E.rx = 0;
     if (E.cy < E.numrows) E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
 
-    if (E.cy < E.rowoff) {
-        E.rowoff = E.cy;
+    if (BABYVIM_WRAP_LINES == 2 && E.cy < E.numrows) {
+        erow *row = &E.row[E.cy];
+        int sub = rowSubrowAtRx(row, E.rx);
+        int cursor_vrow = rowAbsoluteVisualRow(E.cy, sub);
+        if (cursor_vrow < E.rowoff) E.rowoff = cursor_vrow;
+        if (cursor_vrow >= E.rowoff + E.textrows) E.rowoff = cursor_vrow - E.textrows + 1;
+
+        E.coloff = 0;
+        return;
     }
-    if (E.cy >= E.rowoff + E.textrows) {
-        E.rowoff = E.cy - E.textrows + 1;
+
+    if (E.cy < E.rowoff) E.rowoff = E.cy;
+    if (E.cy >= E.rowoff + E.textrows) E.rowoff = E.cy - E.textrows + 1;
+    if (E.rx < E.coloff) E.coloff = E.rx;
+    if (E.rx >= E.coloff + E.textcols) E.coloff = E.rx - E.textcols + 1;
+}
+
+void editorDrawRow(struct abuf *ab, erow *row, int coloff, int rowlen) {
+    char *c = &row->render[coloff];
+    unsigned char *hl = &row->hl[coloff];
+    int current_color = -1;
+    for (int j = 0; j < rowlen; j++) {
+        if (iscntrl(c[j])) { // control characters inverted color
+            char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+            abAppend(ab, "\x1b[7m", 4);
+            abAppend(ab, &sym, 1);
+            abAppend(ab, "\x1b[m", 3); // reset default formatting
+            if (current_color != -1) { // restore color
+                char buf[16];
+                int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+                abAppend(ab, buf, clen);
+            }
+        } else if (hl[j] == HL_NORMAL) {
+            if (current_color != -1) { // reset color
+                abAppend(ab, "\x1b[39m", 5);
+                current_color = -1;
+            }
+            abAppend(ab, &c[j], 1);
+        } else {
+            int color = editorSyntaxToColor(hl[j]);
+            if (current_color != color) { // only change color if it's different
+                current_color = color;
+                char buf[16];
+                int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+                abAppend(ab, buf, clen);
+            }
+            abAppend(ab, &c[j], 1);
+        }
     }
-    if (E.rx < E.coloff) {
-        E.coloff = E.rx;
+    abAppend(ab, "\x1b[39m", 5); // restore default color
+    if (rowlen < E.textcols) abAppend(ab, "\x1b[K", 3); // clear the line
+    abAppend(ab, "\r\n", 2); // print the new line
+}
+
+void editorDrawSidebar(struct abuf *ab, int *rownum) {
+    char buf[16];
+    int len = E.linenumwidth;
+    if (rownum == NULL) {
+        memset(buf, ' ', E.linenumwidth);
+        buf[E.linenumwidth] = '\0';
+    } else {
+        len = snprintf(buf, sizeof(buf),
+            "\x1b[90m%-*d\x1b[m", E.linenumwidth, *rownum + 1);
     }
-    if (E.rx >= E.coloff + E.textcols) {
-        E.coloff = E.rx - E.textcols + 1;
-    }
+    abAppend(ab, buf, len);
 }
 
 void editorDrawRows(struct abuf *ab) {
+    int cur_v = E.rowoff;
+    int y_limit = E.numrows;
+    if (BABYVIM_WRAP_LINES == 2) {
+        int total = 0; 
+        for (int i = 0; i < E.numrows; i++) total += rowVisualHeight(&E.row[i]);
+        y_limit = total;
+    }
+
     for (int y = 0; y < E.textrows; y++) {
-        int filerow = y + E.rowoff;
-        if (filerow >= E.numrows) {
+        // lines starting with ~
+        if (cur_v >= y_limit) {
             if (E.numrows == 0 &&y == E.textrows / 3) { // print welcome message
                 char welcome[80];
                 int welcomelen = snprintf(welcome, sizeof(welcome),
@@ -909,57 +1038,25 @@ void editorDrawRows(struct abuf *ab) {
                 }
                 while (padding--) abAppend(ab, " ", 1);
                 abAppend(ab, welcome, welcomelen);
+                abAppend(ab, "\x1b[K\r\n", 5);
             } else {
-                abAppend(ab, "\x1b[90m~", 6);
-                abAppend(ab, "\x1b[m", 3);
+                abAppend(ab, "\x1b[90m~\x1b[m\x1b[K\r\n", 14);
             }
-        } else {
-            // Print line number
-            char buf[16];
-            int clen = snprintf(buf, sizeof(buf),
-                           "\x1b[90m%-*d\x1b[m", E.linenumwidth, filerow + 1);
-            abAppend(ab, buf, clen);
-
-            int len = E.row[filerow].rsize - E.coloff;
-            if (len < 0) len = 0;
-            if (len > E.textcols) len = E.textcols;
-
-            char *c = &E.row[filerow].render[E.coloff];
-            unsigned char *hl = &E.row[filerow].hl[E.coloff];
-            int current_color = -1;
-            for (int j = 0; j < len; j++) {
-                if (iscntrl(c[j])) { // control characters inverted color
-                    char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-                    abAppend(ab, "\x1b[7m", 4);
-                    abAppend(ab, &sym, 1);
-                    abAppend(ab, "\x1b[m", 3); // reset default formatting
-                    if (current_color != -1) { // restore color
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
-                        abAppend(ab, buf, clen);
-                    }
-                } else if (hl[j] == HL_NORMAL) {
-                    if (current_color != -1) { // reset color
-                        abAppend(ab, "\x1b[39m", 5);
-                        current_color = -1;
-                    }
-                    abAppend(ab, &c[j], 1);
-                } else {
-                    int color = editorSyntaxToColor(hl[j]);
-                    if (current_color != color) { // only change color if it's different
-                        current_color = color;
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
-                        abAppend(ab, buf, clen);
-                    }
-                    abAppend(ab, &c[j], 1);
-                }
-            }
-            abAppend(ab, "\x1b[39m", 5); // restore default color
+            continue;
         }
 
-        abAppend(ab, "\x1b[K", 3);
-        abAppend(ab, "\r\n", 2);
+        int filerow, subrow;
+        visualIndexToFile(cur_v, &filerow, &subrow);
+        erow *row = (filerow >= 0 && filerow < E.numrows) ? &E.row[filerow] : NULL;
+
+        // Print line number
+        editorDrawSidebar(ab, subrow == 0 ? &filerow : NULL);
+
+        int coloff = E.coloff + subrow * E.textcols;
+        int remain = row->size - coloff;
+        int take = remain > 0 ? (remain < E.textcols ? remain : E.textcols) : 0;
+        editorDrawRow(ab, row, coloff, take);
+        cur_v++;
     }
 }
 
@@ -1066,8 +1163,82 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
 }
 
 void editorMoveCursor(int key) {
-    erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    static int desired_col_in_subrow = -1;
+    erow *row = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
     
+    // ensure rx is up to date
+    if (row) E.rx = editorRowCxToRx(row, E.cx);
+
+    if (BABYVIM_WRAP_LINES == 2 && row) {
+        int subrow = rowSubrowAtRx(row, E.rx);
+        int col_in_subrow = rowcolInSubrow(row, E.rx);
+        if (desired_col_in_subrow < 0) desired_col_in_subrow = col_in_subrow;
+
+        if (key == ARROW_UP || key == ARROW_DOWN) {
+            int tgt_row = E.cy;
+            int tgt_sub = subrow + (key == ARROW_UP ? -1 : 1);
+
+            if (tgt_sub < 0) {
+                // go to previous row's last subrow
+                if (E.cy > 0) {
+                    tgt_row--;
+                    erow *prev_row = &E.row[tgt_row];
+                    tgt_sub = rowVisualHeight(prev_row) - 1;
+                } else {
+                    tgt_sub = 0;
+                }
+            } else if (tgt_sub >= rowVisualHeight(row)) {
+                // go to next row's first subrow
+                if (E.cy < E.numrows - 1) {
+                    tgt_row++;
+                    tgt_sub = 0;
+                } else {
+                    tgt_sub = rowVisualHeight(row) - 1;
+                }
+            }
+
+            // move
+            E.cy = tgt_row;
+            erow *trow = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
+            int base_rx = tgt_sub * E.textcols;
+            int target_rx = base_rx + desired_col_in_subrow;
+            if (trow) {
+                if (target_rx > trow->size) target_rx = trow->size;
+                E.cx = editorRowRxToCx(trow, target_rx);
+            }
+            return;
+        }
+
+        // left and right must behave normally
+        switch (key) {
+            case ARROW_LEFT:
+                if (E.cx != 0) {
+                    E.cx--;
+                } else if (E.cy > 0) { // Move to the previous line
+                    E.cy--;
+                    E.cx = E.row[E.cy].size;
+                }
+                break;
+            case ARROW_RIGHT:
+                if (row && E.cx < row->size) { // Move to the next character
+                    E.cx++;
+                } else if (E.cy < E.numrows) { // Move to the next line
+                    E.cy++;
+                    E.cx = 0;
+                }
+                break;
+        }
+
+        // update desired visual column
+        row = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
+        if (row) {
+            E.rx = editorRowCxToRx(row, E.cx);
+            desired_col_in_subrow = rowcolInSubrow(row, E.rx);
+        }
+        return;
+    }
+
+    // Original behavior
     switch (key) {
         case ARROW_LEFT:
             if (E.cx != 0) {

@@ -23,9 +23,10 @@
 #define BABYVIM_SPACE_TYPE 1 // 0: tabs, 1: spaces
 #define BABYVIM_TAB_STOP 4
 #define BABYVIM_QUIT_TIMES 3
-#define BABYVIM_WRAP_LINES 0 // 0: no wrap, 1: hard wrap, 2: soft wrap
+#define BABYVIM_WRAP_LINES 1 // 0: no wrap, 1: hard wrap, 2: soft wrap
 
 #define CTRL_KEY(k) ((k) & 0x1f)
+#define is_space(c) (c == ' ' || c == '\t')
 
 enum editorKey {
     BACKSPACE = 127,
@@ -143,6 +144,11 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+void editorHardWrapRow(int idx);
+void editorIndentRow(erow *row, int indent);
+
+static int WRAP_IN_PROGRESS = 0;
+static int FILE_LOADING = 0;
 
 /*** append buffer ***/
 
@@ -503,6 +509,12 @@ void editorUpdateRow(erow *row) {
     row->render[idx] = '\0';
     row->rsize = idx;
 
+    if (BABYVIM_WRAP_LINES == 1 && !FILE_LOADING &&
+        !WRAP_IN_PROGRESS && row->rsize >= E.textcols) { // hard wrap
+        editorHardWrapRow(row->idx);
+        return;
+    }
+
     editorUpdateSyntax(row);
 }
 
@@ -534,6 +546,54 @@ void editorInsertRow(int at, char *s, size_t len) {
         E.linenumwidth = linenumwidth;
     }
     E.dirty++;
+}
+
+void editorHardWrapRow(int idx) {
+    if (idx < 0 || idx >= E.numrows) return;
+    erow *row = &E.row[idx];
+
+    if (row->rsize < E.textcols) return; // nothing to wrap
+
+    WRAP_IN_PROGRESS = 1;
+
+    while (row->rsize >= E.textcols) {
+        // single line comments and strings must not be wrapped
+        if (row->hl[E.textcols] == HL_STRING || row->hl[E.textcols] == HL_COMMENT) break;
+        
+        // find suitable wrapping point
+        int split_cx = editorRowRxToCx(row, E.textcols - 1);
+        while (split_cx > 0 && !is_space(row->chars[split_cx])) split_cx--;
+
+        // leading whitespace
+        int left_end = split_cx;
+        while (left_end > 0 && is_space(row->chars[left_end])) left_end--;
+
+        // trailing whitespace
+        int right_start = split_cx;
+        while (right_start < row->size && is_space(row->chars[right_start])) right_start++;
+
+        // insert row
+        int remainder_len = row->size - right_start;
+        editorInsertRow(idx + 1, &row->chars[right_start], remainder_len);
+
+        row = &E.row[idx]; // reassign because of the realloc
+        row->size = left_end + 1;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row); // new row is updated by insertion
+        editorIndentRow(&E.row[idx + 1], row->indent - E.row[idx + 1].indent);
+
+        // if user was typing, reposition the cursor
+        if (E.cy == idx && E.cx > left_end) {
+            int tail = E.cx - right_start;
+            E.cy = idx + 1;
+            E.cx = E.row[E.cy].indent + (tail < 0 ? 0 : tail);
+        }
+
+        // continue wrapping
+        row = &E.row[idx + 1];
+    }
+
+    WRAP_IN_PROGRESS = 0;
 }
 
 void editorFreeRow(erow *row) {
@@ -675,6 +735,8 @@ void editorOpen(char *filename) {
         return;
     }; // if file doesn't exist, just set syntax highlighting and dirty flag
 
+    FILE_LOADING = 1;
+
     char *line = NULL;
     size_t linecap = 0;
     ssize_t linelen;
@@ -688,6 +750,14 @@ void editorOpen(char *filename) {
     free(line);
     fclose(fp);
     E.dirty = 0;
+    FILE_LOADING = 0;
+
+    // wrap pass
+    if (BABYVIM_WRAP_LINES == 1) {
+        for (int j = 0; j < E.numrows; j++) {
+            editorHardWrapRow(j);
+        }
+    }
 }
 
 void editorSave() {

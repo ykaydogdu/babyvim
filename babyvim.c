@@ -38,7 +38,11 @@ enum editorKey {
     HOME_KEY,
     END_KEY,
     PAGE_UP,
-    PAGE_DOWN
+    PAGE_DOWN,
+    SHIFT_LEFT,
+    SHIFT_RIGHT,
+    SHIFT_UP,
+    SHIFT_DOWN,
 };
 
 enum editorHighlight {
@@ -78,6 +82,13 @@ typedef struct erow {
     int hl_open_comment;
 } erow;
 
+struct editorSelection {
+    int active;
+    int sx, sy;
+};
+
+#define EDITOR_SELECTION_INIT {0, -1, -1}
+
 struct editorConfig {
     int cx, cy;
     int rx;
@@ -94,6 +105,7 @@ struct editorConfig {
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    struct editorSelection selection;
     struct editorSyntax *syntax;
     struct termios orig_termios;
 };
@@ -210,7 +222,7 @@ int editorReadKey() {
 
     // Handle escape sequences
     if (c == '\x1b') {
-        char seq[3];
+        char seq[5];
 
         if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
         if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
@@ -227,6 +239,17 @@ int editorReadKey() {
                         case '6': return PAGE_DOWN;
                         case '7': return HOME_KEY;
                         case '8': return END_KEY;
+                    }
+                } else if (seq[2] == ';') {
+                    if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
+                    if (seq[3] == '2') { // shift keys
+                        if (read(STDIN_FILENO, &seq[4], 1) != 1) return '\x1b';
+                        switch (seq[4]) {
+                            case 'A': return SHIFT_UP;
+                            case 'B': return SHIFT_DOWN;
+                            case 'C': return SHIFT_RIGHT;
+                            case 'D': return SHIFT_LEFT;
+                        }
                     }
                 }
             }
@@ -299,6 +322,10 @@ static void visualIndexToFile(int vindex, int *outRow, int *outSubrow) {
     }
     *outRow = E.numrows > 0 ? E.numrows - 1 : 0; // clamp to last row
     *outSubrow = 0;
+}
+
+static inline int isLessCoord(int x1, int y1, int x2, int y2) {
+    return y1 < y2 || (y1 == y2 && x1 < x2);
 }
 
 void refreshCursorPosition(struct abuf *ab) {
@@ -733,7 +760,60 @@ int editorRowDelChar(erow *row, int at) {
 
 /*** editor operations ***/
 
+static inline void normalizeSelection(int *sx, int *sy, int *ex, int *ey) {
+    if (isLessCoord(E.selection.sx, E.selection.sy, E.cx, E.cy)) {
+        *sx = E.selection.sx;
+        *sy = E.selection.sy;
+        *ex = E.cx;
+        *ey = E.cy;
+    } else {
+        *sx = E.cx;
+        *sy = E.cy;
+        *ex = E.selection.sx;
+        *ey = E.selection.sy;
+    }
+}
+
+void editorDelSelection() {
+    if (!E.selection.active || E.numrows == 0) return;
+
+    int sx, sy, ex, ey;
+    normalizeSelection(&sx, &sy, &ex, &ey);
+
+    if (sy == ey) { // delete chars
+        erow *row = &E.row[sy];
+        memmove(&row->chars[sx], &row->chars[ex], row->size - ex + 1); // terminator
+        row->size -= ex - sx;
+        editorUpdateRow(row);
+    } else {
+        erow *rowS = &E.row[sy];
+        erow *rowE = &E.row[ey];
+        
+        int right_len = rowE->size - ex;
+        char *right = right_len > 0 ? malloc(right_len + 1) : NULL;
+        if (right) memcpy(right, &rowE->chars[ex], right_len);
+
+        // truncate start row
+        rowS->size = sx;
+        rowS->chars[sx] = '\0';
+        editorUpdateRow(rowS);
+
+        // delete rows between
+        for (int r = sy + 1; r <= ey; r++) editorDelRow(r);
+
+        if (right_len > 0) {
+            editorRowAppendString(rowS, right, right_len);
+            free(right);
+        }
+    }
+    
+    E.cy = sy; E.cx = sx;
+    E.dirty++;
+}
+
 void editorInsertChar(int c) {
+    if (E.selection.active) editorDelSelection();
+
     if (E.cy == E.numrows) editorInsertRow(E.numrows, "", 0);
     editorRowInsertChar(&E.row[E.cy], E.cx, c);
     E.cx++;
@@ -959,10 +1039,23 @@ void editorScroll() {
     if (E.rx >= E.coloff + E.textcols) E.coloff = E.rx - E.textcols + 1;
 }
 
+static inline int isCellSelected(int filerow, int cx) {
+    if (!E.selection.active) return 0;
+    if (E.selection.sx == E.cx && E.selection.sy == E.cy) return 0;
+
+    int sx, sy, ex, ey;
+    normalizeSelection(&sx, &sy, &ex, &ey);
+
+    return (isLessCoord(sx, sy, cx, filerow) &&
+           isLessCoord(cx, filerow, ex, ey)) ||
+           (sx == cx && sy == filerow);
+}
+
 void editorDrawRow(struct abuf *ab, erow *row, int coloff, int rowlen) {
     char *c = &row->render[coloff];
     unsigned char *hl = &row->hl[coloff];
     int current_color = -1;
+    int selected = 0;
     for (int j = 0; j < rowlen; j++) {
         if (iscntrl(c[j])) { // control characters inverted color
             char sym = (c[j] <= 26) ? '@' + c[j] : '?';
@@ -974,24 +1067,37 @@ void editorDrawRow(struct abuf *ab, erow *row, int coloff, int rowlen) {
                 int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
                 abAppend(ab, buf, clen);
             }
-        } else if (hl[j] == HL_NORMAL) {
-            if (current_color != -1) { // reset color
-                abAppend(ab, "\x1b[39m", 5);
-                current_color = -1;
-            }
-            abAppend(ab, &c[j], 1);
         } else {
-            int color = editorSyntaxToColor(hl[j]);
-            if (current_color != color) { // only change color if it's different
-                current_color = color;
-                char buf[16];
-                int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
-                abAppend(ab, buf, clen);
+            // selection
+            int x = editorRowRxToCx(row, coloff + j);
+            int y = row->idx;
+            if (!selected && isCellSelected(y, x)) {
+                selected = 1;
+                abAppend(ab, "\x1b[7m", 4);
+            } else if (!isCellSelected(y, x)) {
+                selected = 0;
+                abAppend(ab, "\x1b[27m", 5);
             }
-            abAppend(ab, &c[j], 1);
+            
+            if (hl[j] == HL_NORMAL) {
+                if (current_color != -1) { // reset color
+                    abAppend(ab, "\x1b[39m", 5);
+                    current_color = -1;
+                }
+                abAppend(ab, &c[j], 1);
+            } else {
+                int color = editorSyntaxToColor(hl[j]);
+                if (current_color != color) { // only change color if it's different
+                    current_color = color;
+                    char buf[16];
+                    int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+                    abAppend(ab, buf, clen);
+                }
+                abAppend(ab, &c[j], 1);
+            }
         }
     }
-    abAppend(ab, "\x1b[39m", 5); // restore default color
+    abAppend(ab, "\x1b[m", 3); // restore default formatting
     if (rowlen < E.textcols) abAppend(ab, "\x1b[K", 3); // clear the line
     abAppend(ab, "\r\n", 2); // print the new line
 }
@@ -1162,7 +1268,19 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     }
 }
 
+static inline int translateShiftKey(int key) {
+    switch (key) {
+        case SHIFT_LEFT: return ARROW_LEFT;
+        case SHIFT_UP: return ARROW_UP;
+        case SHIFT_DOWN: return ARROW_DOWN;
+        case SHIFT_RIGHT: return ARROW_RIGHT;
+        default: return key;
+    }
+}
+
 void editorMoveCursor(int key) {
+    key = translateShiftKey(key);
+
     static int desired_col_in_subrow = -1;
     erow *row = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
     
@@ -1272,6 +1390,10 @@ void editorMoveCursor(int key) {
     if (E.cx > rowlen) E.cx = rowlen;
 }
 
+static inline int isShiftKey(int c) {
+    return c == SHIFT_UP || c == SHIFT_LEFT || c == SHIFT_DOWN || c == SHIFT_RIGHT;
+}
+
 void editorProcessKeypress() {
     static int quit_times = BABYVIM_QUIT_TIMES;
 
@@ -1332,6 +1454,18 @@ void editorProcessKeypress() {
             break;
         }
 
+        case SHIFT_UP:
+        case SHIFT_LEFT:
+        case SHIFT_DOWN:
+        case SHIFT_RIGHT:
+            if (E.selection.active == 0) {
+                E.selection.sx = E.cx;
+                E.selection.sy = E.cy;
+                E.selection.active = 1;
+            }
+            editorMoveCursor(c);
+            break;
+
         case HOME_KEY:
             E.cx = 0;
             break;
@@ -1343,6 +1477,11 @@ void editorProcessKeypress() {
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DEL_KEY:
+            if (E.selection.active) {
+                editorDelSelection();
+                E.selection.active = 0;
+                break;
+            }
             if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
             editorDelChar();
             break;
@@ -1356,6 +1495,7 @@ void editorProcessKeypress() {
             break;
     }
 
+    if (!isShiftKey(c)) E.selection.active = 0;
     quit_times = BABYVIM_QUIT_TIMES;
 }
 
@@ -1375,6 +1515,9 @@ void initEditor() {
     E.statusmsg[0] = '\0';
     E.statusmsg_time = 0;
     E.syntax = NULL;
+
+    struct editorSelection selection = EDITOR_SELECTION_INIT;
+    E.selection = selection;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
     E.textrows = E.screenrows - 2; // for the status line

@@ -89,6 +89,7 @@ struct editorSelection {
 #define EDITOR_SELECTION_INIT {0, -1, -1}
 
 struct editorConfig {
+    int mode; // 0: normal, 1: insert
     int cx, cy;
     int rx;
     int rowoff;
@@ -199,6 +200,9 @@ void disableRawMode() {
 }
 
 void enableRawMode() {
+    printf("\x1b[?2004l"); // disable bracketed paste
+    fflush(stdout);
+
     if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
     atexit(disableRawMode);
 
@@ -729,9 +733,10 @@ void editorRowInsertChar(erow *row, int at, int c) {
     E.dirty++;
 }
 
-void editorRowAppendString(erow *row, char *s, size_t len) {
+void editorRowInsertString(erow *row, int at, char *s, size_t len) {
+    if (at < 0 || at > row->size) at = row->size;
     row->chars = realloc(row->chars, row->size + len + 1);
-    memcpy(&row->chars[row->size], s, len);
+    memcpy(&row->chars[at], s, len);
     row->size += len;
     row->chars[row->size] = '\0';
     editorUpdateRow(row);
@@ -810,13 +815,62 @@ void editorDelSelection() {
         for (int r = sy + 1; r <= ey; r++) editorDelRow(r);
 
         if (right_len > 0) {
-            editorRowAppendString(rowS, right, right_len);
+            editorRowInsertString(rowS, sx, right, right_len);
             free(right);
         }
     }
     
     E.cy = sy; E.cx = sx;
     E.dirty++;
+    E.selection.active = 0;
+}
+
+void editorCopySelection() {
+    if (!E.selection.active || E.numrows == 0) return;
+    int sx, sy, ex, ey;
+    normalizeSelection(&sx, &sy, &ex, &ey);
+
+    if (sy == ey) { // single line
+        erow *row = &E.row[sy];
+        int len = ex - sx;
+        E.copyBuffer = malloc(len + 1);
+        memcpy(E.copyBuffer, &row->chars[sx], len);
+        E.copyBuffer[len] = '\0';
+    } else { // multi-line
+        erow *rowS = &E.row[sy];
+        erow *rowE = &E.row[ey];
+
+        // calculate the total length of the selection
+        int left_len = rowS->size - sx + 1;
+        int right_len = ex + 1;
+        int total_len = left_len + right_len;
+        for (int r = sy + 1; r < ey; r++) total_len += E.row[r].size;
+
+        int idx = 0;
+        E.copyBuffer = malloc(total_len + 1);
+
+        memcpy(E.copyBuffer, &rowS->chars[sx], left_len);
+        idx += left_len;
+        // copy the middle rows
+        for (int r = sy + 1; r < ey; r++) {
+            memcpy(E.copyBuffer + idx, E.row[r].chars, E.row[r].size);
+            idx += E.row[r].size;
+        }
+        // copy the right row
+        memcpy(E.copyBuffer + idx, &rowE->chars[ex], right_len);
+        E.copyBuffer[total_len] = '\0';
+    }
+}
+
+void editorInsertString(char *s, size_t len) {
+    if (E.cy == E.numrows) editorInsertRow(E.numrows, "", 0);
+    editorRowInsertString(&E.row[E.cy], E.cx, s, len);
+    E.cx += len;
+}
+
+void editorPasteSelection() {
+    if (E.copyBuffer == NULL) return;
+    editorInsertString(E.copyBuffer, strlen(E.copyBuffer));
 }
 
 void editorInsertChar(int c) {
@@ -853,7 +907,7 @@ void editorDelChar() {
     } else {
         if (E.cy == 0) return;
         E.cx = E.row[E.cy - 1].size;
-        editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+        editorRowInsertString(&E.row[E.cy - 1], E.cx, row->chars, row->size);
         editorDelRow(E.cy);
         E.cy--;
     }
@@ -1425,6 +1479,18 @@ void editorProcessKeypress() {
             editorFind();
             break;
 
+        case CTRL_KEY('c'):
+            if (E.selection.active) editorCopySelection();            
+            break;
+
+        case CTRL_KEY('x'):
+            if (E.selection.active) editorCopySelection();
+            editorDelSelection();
+            break;
+
+        case CTRL_KEY('v'):
+            editorPasteSelection();
+            break;
 
         case SHIFT_KEY(ARROW_UP):
         case SHIFT_KEY(ARROW_DOWN):
@@ -1456,7 +1522,7 @@ void editorProcessKeypress() {
         case SHIFT_KEY(HOME_KEY):
             if (!E.selection.active) startSelection();
         case HOME_KEY:
-            E.cx = 0;
+            E.cx = E.row[E.cy].indent;
             break;
 
         case SHIFT_KEY(END_KEY):
@@ -1494,6 +1560,7 @@ void editorProcessKeypress() {
 /*** init ***/
 
 void initEditor() {
+    E.mode = 0;
     E.cx = 0;
     E.cy = 0;
     E.rx = 0;
@@ -1522,6 +1589,15 @@ int main(int argc, char *argv[]) {
     initEditor();
     if (argc >= 2) {
         editorOpen(argv[1]);
+        if (argc >= 3) {
+            if (argv[2][0] == '+' || argv[2][0] == '-') {
+                E.mode = argv[2][0] == '+' ? 1 : 0;
+                int y = atoi(&argv[2][1]) - 1;
+                y = y < 0 ? 0 : y;
+                E.cy = y;
+                E.rowoff = y;
+            }
+        }
     }
 
     editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");

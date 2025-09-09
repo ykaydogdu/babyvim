@@ -38,12 +38,11 @@ enum editorKey {
     HOME_KEY,
     END_KEY,
     PAGE_UP,
-    PAGE_DOWN,
-    SHIFT_LEFT,
-    SHIFT_RIGHT,
-    SHIFT_UP,
-    SHIFT_DOWN,
+    PAGE_DOWN
 };
+#define SHIFT_KEY(k) (k + 1000) // arbitrary offset to editorKey enum
+#define isShiftKey(k) (k >= 2000)
+#define translateShiftKey(k) (isShiftKey(k) ? k - 1000 : k)
 
 enum editorHighlight {
     HL_NORMAL = 0,
@@ -105,6 +104,7 @@ struct editorConfig {
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    char *copyBuffer;
     struct editorSelection selection;
     struct editorSyntax *syntax;
     struct termios orig_termios;
@@ -240,15 +240,17 @@ int editorReadKey() {
                         case '7': return HOME_KEY;
                         case '8': return END_KEY;
                     }
-                } else if (seq[2] == ';') {
+                } else if (seq[2] == ';') { // combination keys
                     if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
                     if (seq[3] == '2') { // shift keys
                         if (read(STDIN_FILENO, &seq[4], 1) != 1) return '\x1b';
                         switch (seq[4]) {
-                            case 'A': return SHIFT_UP;
-                            case 'B': return SHIFT_DOWN;
-                            case 'C': return SHIFT_RIGHT;
-                            case 'D': return SHIFT_LEFT;
+                            case 'A': return SHIFT_KEY(ARROW_UP);
+                            case 'B': return SHIFT_KEY(ARROW_DOWN);
+                            case 'C': return SHIFT_KEY(ARROW_RIGHT);
+                            case 'D': return SHIFT_KEY(ARROW_LEFT);
+                            case 'H': return SHIFT_KEY(HOME_KEY);
+                            case 'F': return SHIFT_KEY(END_KEY);
                         }
                     }
                 }
@@ -774,6 +776,12 @@ static inline void normalizeSelection(int *sx, int *sy, int *ex, int *ey) {
     }
 }
 
+static inline void startSelection() {
+    E.selection.sx = E.cx;
+    E.selection.sy = E.cy;
+    E.selection.active = 1;
+}
+
 void editorDelSelection() {
     if (!E.selection.active || E.numrows == 0) return;
 
@@ -1268,16 +1276,6 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     }
 }
 
-static inline int translateShiftKey(int key) {
-    switch (key) {
-        case SHIFT_LEFT: return ARROW_LEFT;
-        case SHIFT_UP: return ARROW_UP;
-        case SHIFT_DOWN: return ARROW_DOWN;
-        case SHIFT_RIGHT: return ARROW_RIGHT;
-        default: return key;
-    }
-}
-
 void editorMoveCursor(int key) {
     key = translateShiftKey(key);
 
@@ -1390,10 +1388,6 @@ void editorMoveCursor(int key) {
     if (E.cx > rowlen) E.cx = rowlen;
 }
 
-static inline int isShiftKey(int c) {
-    return c == SHIFT_UP || c == SHIFT_LEFT || c == SHIFT_DOWN || c == SHIFT_RIGHT;
-}
-
 void editorProcessKeypress() {
     static int quit_times = BABYVIM_QUIT_TIMES;
 
@@ -1432,12 +1426,17 @@ void editorProcessKeypress() {
             break;
 
 
+        case SHIFT_KEY(ARROW_UP):
+        case SHIFT_KEY(ARROW_DOWN):
+        case SHIFT_KEY(ARROW_RIGHT):
+        case SHIFT_KEY(ARROW_LEFT):
+            if (!E.selection.active) startSelection();
         case ARROW_UP:
         case ARROW_DOWN:
         case ARROW_LEFT:
         case ARROW_RIGHT:
             editorMoveCursor(c);
-            break;
+            break;  
 
         case PAGE_UP:
         case PAGE_DOWN:
@@ -1454,21 +1453,14 @@ void editorProcessKeypress() {
             break;
         }
 
-        case SHIFT_UP:
-        case SHIFT_LEFT:
-        case SHIFT_DOWN:
-        case SHIFT_RIGHT:
-            if (E.selection.active == 0) {
-                E.selection.sx = E.cx;
-                E.selection.sy = E.cy;
-                E.selection.active = 1;
-            }
-            editorMoveCursor(c);
-            break;
-
+        case SHIFT_KEY(HOME_KEY):
+            if (!E.selection.active) startSelection();
         case HOME_KEY:
             E.cx = 0;
             break;
+
+        case SHIFT_KEY(END_KEY):
+            if (!E.selection.active) startSelection();
         case END_KEY:
             if (E.cy < E.numrows)
                 E.cx = E.row[E.cy].size;
@@ -1518,6 +1510,7 @@ void initEditor() {
 
     struct editorSelection selection = EDITOR_SELECTION_INIT;
     E.selection = selection;
+    E.copyBuffer = NULL;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
     E.textrows = E.screenrows - 2; // for the status line

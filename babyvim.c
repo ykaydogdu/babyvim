@@ -58,6 +58,11 @@ enum editorHighlight {
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 
+enum editorMode {
+    NORMAL_MODE,
+    INSERT_MODE
+};
+
 /*** data ***/
 
 struct editorSyntax {
@@ -89,7 +94,8 @@ struct editorSelection {
 #define EDITOR_SELECTION_INIT {0, -1, -1}
 
 struct editorConfig {
-    int mode; // 0: normal, 1: insert
+    enum editorMode mode;
+    int commandEntering;
     int cx, cy;
     int rx;
     int rowoff;
@@ -154,7 +160,7 @@ struct editorSyntax HLDB[] = {
 
 /*** prototypes ***/
 
-void editorSetStatusMessage(const char *fmt, ...);
+void editorSetStatusMessage(int clear, const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorHardWrapRow(int idx);
@@ -335,6 +341,13 @@ static inline int isLessCoord(int x1, int y1, int x2, int y2) {
 }
 
 void refreshCursorPosition(struct abuf *ab) {
+    if (E.commandEntering) {
+        char buf[32];
+        int len = snprintf(buf, sizeof(buf), "\x1b[%d;%luH", E.screenrows, strlen(E.statusmsg) + 1);
+        abAppend(ab, buf, len);
+        return;
+    }
+
     int vrow, vcol;
     erow *row = E.cy < E.numrows ? &E.row[E.cy] : NULL;
 
@@ -767,6 +780,12 @@ int editorRowDelChar(erow *row, int at) {
 
 /*** editor operations ***/
 
+static inline int getVisualRowCount() {
+    int res = 0;
+    for (int r = 0; r < E.numrows; r++) res += rowVisualHeight(&E.row[r]);
+    return res;
+}
+
 static inline void normalizeSelection(int *sx, int *sy, int *ex, int *ey) {
     if (isLessCoord(E.selection.sx, E.selection.sy, E.cx, E.cy)) {
         *sx = E.selection.sx;
@@ -970,11 +989,17 @@ void editorOpen(char *filename) {
     }
 }
 
+void editorClose() {
+    write(STDOUT_FILENO, "\x1b[2J", 4); // Clear screen
+    write(STDOUT_FILENO, "\x1b[H", 3); // Move cursor to top-left corner
+    exit(0);
+}
+
 void editorSave() {
     if (E.filename == NULL) {
         E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
         if (E.filename == NULL) {
-            editorSetStatusMessage("Save aborted");
+            editorSetStatusMessage(1, "Save aborted");
             return;
         }
         editorSelectSyntaxHighlight();
@@ -990,14 +1015,14 @@ void editorSave() {
                 close(fd);
                 free(buf);
                 E.dirty = 0;
-                editorSetStatusMessage("%d bytes written to disk", len);
+                editorSetStatusMessage(1, "%d bytes written to disk", len);
                 return;
             }
         }
         close(fd);
     }
     free(buf);
-    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+    editorSetStatusMessage(1, "Can't save! I/O error: %s", strerror(errno));
 }
 
 /*** find ***/
@@ -1076,6 +1101,64 @@ void editorFind() {
         E.coloff = saved_coloff;
         E.rowoff = saved_rowoff;
     }
+}
+
+/*** normal mode ***/
+
+static char *skip_ws(char *s) { while (*s && isspace(*s)) s++; return s;}
+
+static void rtrim_inplace(char *s) {
+    if (!s) return;
+    char *end = s + strlen(s) - 1;
+    while (end >= s && isspace(*end)) end--;
+    end[1] = '\0';
+}
+
+static char *trim_inplace(char *s) { rtrim_inplace(s); return skip_ws(s); }
+
+static int starts_with(const char *s, const char *prefix) {
+    while (*prefix && *s) {
+        char a = tolower(*s++);
+        char b = tolower(*prefix++);
+        if (a != b) return 0;
+    }
+    return *prefix == '\0';
+}
+
+static int parse_long(const char *s, long *out) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return 0;
+    *out = v;
+    return 1;
+}
+
+void editorNormalModeCallback(char *query, int key) {
+    if (key != '\r') return;
+
+    char *cmd = trim_inplace(query);
+    if (*cmd == '\0') { E.commandEntering = 0; return; }
+
+    // single chars
+    if ((cmd[0] == 'w' || cmd[0] == 'q' || cmd[0] == 'l') && cmd[1] == '\0') {
+        if (cmd[0] == 'w') editorSave();
+        else if (cmd[0] == 'q') editorClose();
+        else if (cmd[0] == 'l') editorSetStatusMessage(1, "\x1b[30;101mUsage: l <line number>\x1b[m");
+        E.commandEntering = 0;
+        return;
+    }
+
+    // special line jumps
+    if (cmd[0] == '$' && cmd[1] == '\0') { 
+        E.cy = getVisualRowCount();
+        E.rowoff = getVisualRowCount() - E.textrows;
+        E.commandEntering = 0;
+        return;
+    }
+
+    // unrecognized command
+    editorSetStatusMessage(1, "\x1b[101mUnrecognized command: %s\x1b[m", cmd);
+    E.commandEntering = 0;
 }
 
 /*** output ***/
@@ -1257,7 +1340,7 @@ void editorDrawMessageBar(struct abuf *ab) {
     abAppend(ab, "\x1b[K", 3);
     int msglen = strlen(E.statusmsg);
     if (msglen > E.screencols) msglen = E.screencols;
-    if (msglen && time(NULL) - E.statusmsg_time < 5)
+    if (msglen && (E.statusmsg_time == -1 || time(NULL) - E.statusmsg_time < 5))
         abAppend(ab, E.statusmsg, msglen);
 }
 
@@ -1282,12 +1365,12 @@ void editorRefreshScreen() {
     abFree(&ab);
 }
 
-void editorSetStatusMessage(const char *fmt, ...) {
+void editorSetStatusMessage(int clear, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
     va_end(ap);
-    E.statusmsg_time = time(NULL);
+    E.statusmsg_time = clear ? time(NULL) : -1;
 }
 
 /*** input ***/
@@ -1300,21 +1383,21 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     buf[0] = '\0';
 
     while (1) {
-        editorSetStatusMessage(prompt, buf);
+        editorSetStatusMessage(0, prompt, buf);
         editorRefreshScreen();
 
         int c = editorReadKey();
         if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
             if (buflen != 0) buf[--buflen] = '\0';
         } else if (c == '\x1b') {
-            editorSetStatusMessage("");
+            editorSetStatusMessage(1, "");
             if (callback) callback(buf, c);
             free(buf);
             return NULL;
         } else if (c == '\r') {
             if (buflen != 0) {
-                editorSetStatusMessage("");
-                if (callback) callback(buf, buflen);
+                editorSetStatusMessage(1, "");
+                if (callback) callback(buf, c);
                 return buf;
             }
         } else if (!iscntrl(c) && c < 128) {
@@ -1446,6 +1529,46 @@ void editorProcessKeypress() {
     static int quit_times = BABYVIM_QUIT_TIMES;
 
     int c = editorReadKey();
+
+    // globals
+    switch (c) {
+        case CTRL_KEY('q'):
+            if (E.dirty && quit_times > 0) {
+                editorSetStatusMessage(1, "WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", quit_times);
+                quit_times--;
+                return;
+            }
+            editorClose();
+            break;
+    
+        case CTRL_KEY('s'):
+            editorSave();
+            break;
+
+        case CTRL_KEY('f'):
+            editorFind();
+            break;
+    }
+
+    // normal mode
+    if (E.mode == NORMAL_MODE) {
+        switch (c) {
+            case 'i':
+                E.mode = INSERT_MODE;
+                editorSetStatusMessage(0, "\x1b[7m--INSERT--\x1b[m");
+                break;
+            case ':': 
+                {
+                    E.commandEntering = 1;
+                    char *query = editorPrompt(":%s", editorNormalModeCallback);
+                    if (query) free(query);
+                }
+                break;
+        }
+        return;
+    }
+
+    // insert mode
     switch (c) {
         case '\r':
             editorInsertNewline();
@@ -1459,25 +1582,6 @@ void editorProcessKeypress() {
                 editorInsertChar(c);
                 break;
             }
-    
-        case CTRL_KEY('q'):
-            if (E.dirty && quit_times > 0) {
-                editorSetStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", quit_times);
-                quit_times--;
-                return;
-            }
-            write(STDOUT_FILENO, "\x1b[2J", 4); // Clear screen
-            write(STDOUT_FILENO, "\x1b[H", 3); // Move cursor to top-left corner
-            exit(0);
-            break;
-
-        case CTRL_KEY('s'):
-            editorSave();
-            break;
-
-        case CTRL_KEY('f'):
-            editorFind();
-            break;
 
         case CTRL_KEY('c'):
             if (E.selection.active) editorCopySelection();            
@@ -1546,6 +1650,7 @@ void editorProcessKeypress() {
 
         case CTRL_KEY('l'):
         case '\x1b':
+            E.mode = NORMAL_MODE;
             break;
 
         default:
@@ -1560,7 +1665,8 @@ void editorProcessKeypress() {
 /*** init ***/
 
 void initEditor() {
-    E.mode = 0;
+    E.mode = NORMAL_MODE;
+    E.commandEntering = 0;
     E.cx = 0;
     E.cy = 0;
     E.rx = 0;
@@ -1591,7 +1697,7 @@ int main(int argc, char *argv[]) {
         editorOpen(argv[1]);
         if (argc >= 3) {
             if (argv[2][0] == '+' || argv[2][0] == '-') {
-                E.mode = argv[2][0] == '+' ? 1 : 0;
+                E.mode = argv[2][0] == '+' ? INSERT_MODE : NORMAL_MODE;
                 int y = atoi(&argv[2][1]) - 1;
                 y = y < 0 ? 0 : y;
                 E.cy = y;
@@ -1600,7 +1706,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+    editorSetStatusMessage(1, "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     while (1) {
         editorRefreshScreen();

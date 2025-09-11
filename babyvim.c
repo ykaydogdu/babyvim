@@ -1139,26 +1139,81 @@ void editorNormalModeCallback(char *query, int key) {
     char *cmd = trim_inplace(query);
     if (*cmd == '\0') { E.commandEntering = 0; return; }
 
+    // digit
+    if (isdigit(cmd[0])) {
+        long line;
+        if (parse_long(cmd, &line)) {
+            E.cy = line - 1;
+            E.rowoff = E.cy;
+        }
+        E.commandEntering = 0;
+        return;
+    }
+
     // single chars
-    if ((cmd[0] == 'w' || cmd[0] == 'q' || cmd[0] == 'l') && cmd[1] == '\0') {
-        if (cmd[0] == 'w') editorSave();
-        else if (cmd[0] == 'q') editorClose();
-        else if (cmd[0] == 'l') editorSetStatusMessage(1, "\x1b[30;101mUsage: l <line number>\x1b[m");
+    if (cmd[1] == '\0') {
+        switch (cmd[0]) {
+            case 'w': editorSave(); break;
+            case 'q': editorClose(); break;
+            case 'l': editorSetStatusMessage(1, "\x1b[30;43mUsage: l <line number>\x1b[m"); break;
+            case '$': E.cy = getVisualRowCount(); E.rowoff = getVisualRowCount() - E.textrows; break;
+            case '^': E.cy = E.rowoff; break;
+            case '.': E.cy = E.rowoff; E.cx = 0; break;
+            default: editorSetStatusMessage(1, "\x1b[41mUnrecognized command: %s\x1b[m", cmd); break;
+        }
         E.commandEntering = 0;
-        return;
     }
 
-    // special line jumps
-    if (cmd[0] == '$' && cmd[1] == '\0') { 
-        E.cy = getVisualRowCount();
-        E.rowoff = getVisualRowCount() - E.textrows;
-        E.commandEntering = 0;
-        return;
+    // tokenization
+    char *space = cmd;
+    while (*space && !isspace(*space)) space++;
+    size_t headlen = (space - cmd);
+    char head[32];
+    headlen = headlen < sizeof(head) - 1 ? headlen : sizeof(head) - 1;
+    memcpy(head, cmd, headlen);
+    head[headlen] = '\0';
+    
+    char *rest = skip_ws(space);
+
+    // write save
+    if (starts_with(head, "wq") || strcmp(head, "x") == 0) {
+        editorSave();
+        editorClose();
+    } else if (strcmp(head, "w") == 0) {
+        if (*rest) {
+            rtrim_inplace(rest);
+            E.filename = rest;
+            editorSave();
+        } else editorSave();
+    } else if (strcmp(head, "q") == 0) {
+        editorClose();
+    } else if (strcmp(head, "q!") == 0) {
+        editorClose();
+    } else if (strcmp(head, "l") == 0 || starts_with(head, "line")) { // line navigation
+        long line;
+        if (parse_long(rest, &line)) {
+            E.cy = line - 1;
+            E.rowoff = E.cy;
+        }
+    } else if (starts_with(head, "set")) { // settings
+        if (starts_with(rest, "number")) {
+        } else if (starts_with(rest, "nonumber")) {
+        } else if (starts_with(rest, "wrap")) {
+        } else if (starts_with(rest, "nowrap")) {
+        } else {
+            editorSetStatusMessage(1, "\x1b[30;43mUnknown option: %s\x1b[m", rest);
+        }
+    } else if (starts_with(head, "h") || starts_with(head, "help")) { // help
+        editorSetStatusMessage(
+            1, "\x1b[43mCommands: :w[ file], :q, :q!, :wq|:x, :l N | :line N | :N, :$, :., :^, :set number|nonumber|wrap|nowrap\x1b[m"
+        );
+    } else {
+        // unrecognized command
+        editorSetStatusMessage(1, "\x1b[41mUnrecognized command: %s\x1b[m", cmd);
     }
 
-    // unrecognized command
-    editorSetStatusMessage(1, "\x1b[101mUnrecognized command: %s\x1b[m", cmd);
     E.commandEntering = 0;
+    editorRefreshScreen();
 }
 
 /*** output ***/
@@ -1529,7 +1584,7 @@ void editorProcessKeypress() {
     static int quit_times = BABYVIM_QUIT_TIMES;
 
     int c = editorReadKey();
-
+    int consumed = 0;
     // globals
     switch (c) {
         case CTRL_KEY('q'):
@@ -1539,62 +1594,18 @@ void editorProcessKeypress() {
                 return;
             }
             editorClose();
+            consumed = 1;
             break;
     
         case CTRL_KEY('s'):
-            editorSave();
-            break;
-
+        editorSave();
+        consumed = 1;
+        break;
+        
         case CTRL_KEY('f'):
-            editorFind();
-            break;
-    }
-
-    // normal mode
-    if (E.mode == NORMAL_MODE) {
-        switch (c) {
-            case 'i':
-                E.mode = INSERT_MODE;
-                editorSetStatusMessage(0, "\x1b[7m--INSERT--\x1b[m");
-                break;
-            case ':': 
-                {
-                    E.commandEntering = 1;
-                    char *query = editorPrompt(":%s", editorNormalModeCallback);
-                    if (query) free(query);
-                }
-                break;
-        }
-        return;
-    }
-
-    // insert mode
-    switch (c) {
-        case '\r':
-            editorInsertNewline();
-            break;
-        case '\t':
-            if (BABYVIM_SPACE_TYPE) {
-                int j = BABYVIM_TAB_STOP;
-                while (j--) editorInsertChar(' ');
-                break;
-            } else {
-                editorInsertChar(c);
-                break;
-            }
-
-        case CTRL_KEY('c'):
-            if (E.selection.active) editorCopySelection();            
-            break;
-
-        case CTRL_KEY('x'):
-            if (E.selection.active) editorCopySelection();
-            editorDelSelection();
-            break;
-
-        case CTRL_KEY('v'):
-            editorPasteSelection();
-            break;
+        editorFind();
+        consumed = 1;
+        break;
 
         case SHIFT_KEY(ARROW_UP):
         case SHIFT_KEY(ARROW_DOWN):
@@ -1606,8 +1617,9 @@ void editorProcessKeypress() {
         case ARROW_LEFT:
         case ARROW_RIGHT:
             editorMoveCursor(c);
+            consumed = 1;
             break;  
-
+    
         case PAGE_UP:
         case PAGE_DOWN:
         {
@@ -1617,47 +1629,101 @@ void editorProcessKeypress() {
                 E.cy = E.rowoff + E.screenrows - 1;
                 if (E.cy > E.numrows) E.cy = E.numrows - 1;
             }
-
+    
             int times = E.screenrows;
             while (times--) editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+            consumed = 1;
             break;
         }
-
+    
         case SHIFT_KEY(HOME_KEY):
             if (!E.selection.active) startSelection();
         case HOME_KEY:
             E.cx = E.row[E.cy].indent;
+            consumed = 1;
             break;
-
+    
         case SHIFT_KEY(END_KEY):
             if (!E.selection.active) startSelection();
         case END_KEY:
             if (E.cy < E.numrows)
                 E.cx = E.row[E.cy].size;
-            break;
-
-        case BACKSPACE:
-        case CTRL_KEY('h'):
-        case DEL_KEY:
-            if (E.selection.active) {
-                editorDelSelection();
-                E.selection.active = 0;
-                break;
-            }
-            if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-            editorDelChar();
-            break;
-
-        case CTRL_KEY('l'):
-        case '\x1b':
-            E.mode = NORMAL_MODE;
-            break;
-
-        default:
-            editorInsertChar(c);
+            consumed = 1;
             break;
     }
 
+    if (consumed) goto finish;
+
+    if (E.mode == NORMAL_MODE) {
+        // normal mode
+        switch (c) {
+            case 'i':
+                E.mode = INSERT_MODE;
+                editorSetStatusMessage(0, "\x1b[1m--INSERT--\x1b[m");
+                break;
+            case ':': 
+                {
+                    E.commandEntering = 1;
+                    char *query = editorPrompt(":%s", editorNormalModeCallback);
+                    if (query) free(query);
+                }
+                break;
+        }
+        return;
+    } else if (E.mode == INSERT_MODE) {
+        // insert mode
+        switch (c) {
+            case '\r':
+                editorInsertNewline();
+                break;
+            case '\t':
+                if (BABYVIM_SPACE_TYPE) {
+                    int j = BABYVIM_TAB_STOP;
+                    while (j--) editorInsertChar(' ');
+                    break;
+                } else {
+                    editorInsertChar(c);
+                    break;
+                }
+    
+            case CTRL_KEY('c'):
+                if (E.selection.active) editorCopySelection();            
+                break;
+    
+            case CTRL_KEY('x'):
+                if (E.selection.active) editorCopySelection();
+                editorDelSelection();
+                break;
+    
+            case CTRL_KEY('v'):
+                editorPasteSelection();
+                break;
+    
+    
+            case BACKSPACE:
+            case CTRL_KEY('h'):
+            case DEL_KEY:
+                if (E.selection.active) {
+                    editorDelSelection();
+                    E.selection.active = 0;
+                    break;
+                }
+                if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+                editorDelChar();
+                break;
+    
+            case CTRL_KEY('l'):
+            case '\x1b':
+                E.mode = NORMAL_MODE;
+                break;
+    
+            default:
+                editorInsertChar(c);
+                break;
+        }
+    }
+
+    finish:
     if (!isShiftKey(c)) E.selection.active = 0;
     quit_times = BABYVIM_QUIT_TIMES;
 }

@@ -26,7 +26,7 @@
 #define BABYVIM_WRAP_LINES 2 // 0: no wrap, 1: hard wrap, 2: soft wrap
 
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define is_space(c) (c == ' ' || c == '\t')
+#define is_space(c) (c == ' ' || c == '\t' || c == '\r' || c == '\n')
 
 enum editorKey {
     BACKSPACE = 127,
@@ -111,6 +111,7 @@ struct editorConfig {
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    char *match_insert;
     char *copyBuffer;
     struct editorSelection selection;
     struct editorSyntax *syntax;
@@ -404,7 +405,7 @@ int getWindowSize(int *rows, int *cols) {
 /*** syntax highlighting ***/
 
 int is_seperator(int c) {
-    return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+    return is_space(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
 
 void editorUpdateSyntax(erow *row) {
@@ -1103,14 +1104,67 @@ void editorFind() {
     }
 }
 
+/*** hippie completion ***/
+
+static void findSimilarWord(char *word) {
+    static char *last_matched_word = NULL;
+    static int last_match_cx = -1; static int last_match_cy = -1;
+
+    if (!last_matched_word || (last_matched_word && strcmp(last_matched_word, word) != 0)) {
+        free(last_matched_word);
+        last_matched_word = NULL;
+        last_match_cx = 0; last_match_cy = E.cy + 1;
+    }
+
+    int len = strlen(word);
+    for (int i = last_match_cy + 1; i < E.numrows; i++) {
+        int r = i < E.numrows ? i : i - E.numrows;
+        erow *row = &E.row[r];
+        char *match = strstr(row->chars, word);
+        if (match) {
+            last_match_cx = match - row->chars;
+            last_match_cy = r;
+            last_matched_word = word;
+
+            // take the remaining part of the word
+            int end = last_match_cx + len;
+            while (end < row->size && !is_seperator(row->chars[end])) end++;
+            int insert_len = end - last_match_cx - len;
+            E.match_insert = malloc(insert_len + 1);
+            memcpy(E.match_insert, &row->chars[last_match_cx + len], insert_len);
+            E.match_insert[insert_len] = '\0';
+            return;
+        }
+    }
+    if (E.match_insert) { free(E.match_insert); E.match_insert = NULL; }
+    if (last_matched_word) { free(last_matched_word); last_matched_word = NULL; }
+    last_match_cx = 0; last_match_cy = E.cy + 1;
+}
+
+void editorHippieCompletion() {
+    // must be in the end of the word
+    if (E.cx != E.row[E.cy].size && !is_space(E.row[E.cy].chars[E.cx])) return;
+    
+    int cx = E.cx == E.row[E.cy].size ? E.cx : E.cx - 1;
+    int sx = cx;
+    while (sx > 0 && !is_space(E.row[E.cy].chars[sx])) sx--;
+    int len = cx - sx;
+    char word[len + 1];
+    memcpy(word, &E.row[E.cy].chars[sx], len);
+    word[len] = '\0';
+
+    // perform completion
+    findSimilarWord(word);
+}
+
 /*** normal mode ***/
 
-static char *skip_ws(char *s) { while (*s && isspace(*s)) s++; return s;}
+static char *skip_ws(char *s) { while (*s && is_space(*s)) s++; return s;}
 
 static void rtrim_inplace(char *s) {
     if (!s) return;
     char *end = s + strlen(s) - 1;
-    while (end >= s && isspace(*end)) end--;
+    while (end >= s && is_space(*end)) end--;
     end[1] = '\0';
 }
 
@@ -1166,7 +1220,7 @@ void editorNormalModeCallback(char *query, int key) {
 
     // tokenization
     char *space = cmd;
-    while (*space && !isspace(*space)) space++;
+    while (*space && !is_space(*space)) space++;
     size_t headlen = (space - cmd);
     char head[32];
     headlen = headlen < sizeof(head) - 1 ? headlen : sizeof(head) - 1;
@@ -1257,6 +1311,14 @@ void editorDrawRow(struct abuf *ab, erow *row, int coloff, int rowlen) {
     int current_color = -1;
     int selected = 0;
     for (int j = 0; j < rowlen; j++) {
+        if (E.match_insert) { // completion
+            if (row->idx == E.cy && j + coloff == editorRowCxToRx(row, E.cx)) {
+                abAppend(ab, "\x1b[90m", 5);
+                abAppend(ab, E.match_insert, strlen(E.match_insert));
+                abAppend(ab, "\x1b[m", 3);
+            }
+        }
+
         if (iscntrl(c[j])) { // control characters inverted color
             char sym = (c[j] <= 26) ? '@' + c[j] : '?';
             abAppend(ab, "\x1b[7m", 4);
@@ -1296,6 +1358,11 @@ void editorDrawRow(struct abuf *ab, erow *row, int coloff, int rowlen) {
                 abAppend(ab, &c[j], 1);
             }
         }
+    }
+    if (E.match_insert && row->idx == E.cy && rowlen == editorRowCxToRx(row, E.cx)) {
+        abAppend(ab, "\x1b[90m", 5);
+        abAppend(ab, E.match_insert, strlen(E.match_insert));
+        abAppend(ab, "\x1b[m", 3);
     }
     abAppend(ab, "\x1b[m", 3); // restore default formatting
     if (rowlen < E.textcols) abAppend(ab, "\x1b[K", 3); // clear the line
@@ -1650,80 +1717,88 @@ void editorProcessKeypress() {
                 E.cx = E.row[E.cy].size;
             consumed = 1;
             break;
-    }
-
-    if (consumed) goto finish;
-
-    if (E.mode == NORMAL_MODE) {
-        // normal mode
-        switch (c) {
-            case 'i':
+        }
+        
+        if (consumed) goto finish;
+        
+        if (E.mode == NORMAL_MODE) {
+            // normal mode
+            switch (c) {
+                case 'i':
                 E.mode = INSERT_MODE;
                 editorSetStatusMessage(0, "\x1b[1m--INSERT--\x1b[m");
                 break;
-            case ':': 
+                case ':': 
                 {
                     E.commandEntering = 1;
                     char *query = editorPrompt(":%s", editorNormalModeCallback);
                     if (query) free(query);
                 }
                 break;
-        }
-        return;
-    } else if (E.mode == INSERT_MODE) {
-        // insert mode
-        switch (c) {
-            case '\r':
-                editorInsertNewline();
-                break;
-            case '\t':
-                if (BABYVIM_SPACE_TYPE) {
-                    int j = BABYVIM_TAB_STOP;
-                    while (j--) editorInsertChar(' ');
+            }
+            return;
+        } else if (E.mode == INSERT_MODE) {
+            // insert mode
+            switch (c) {
+                case '\r':
+                    editorInsertNewline();
                     break;
-                } else {
+                case '\t':
+                    if (E.match_insert) {
+                        editorInsertString(E.match_insert, strlen(E.match_insert));
+                        break;
+                    }
+                    if (BABYVIM_SPACE_TYPE) {
+                        int j = BABYVIM_TAB_STOP;
+                        while (j--) editorInsertChar(' ');
+                        break;
+                    } else {
+                        editorInsertChar(c);
+                        break;
+                    }
+
+                case '`':
+                    editorHippieCompletion();
+                    break;
+                
+                case CTRL_KEY('c'):
+                    if (E.selection.active) editorCopySelection();            
+                    break;
+                
+                case CTRL_KEY('x'):
+                    if (E.selection.active) editorCopySelection();
+                    editorDelSelection();
+                    break;
+                
+                case CTRL_KEY('v'):
+                    editorPasteSelection();
+                    break;
+    
+                case BACKSPACE:
+                case CTRL_KEY('h'):
+                case DEL_KEY:
+                    if (E.selection.active) {
+                        editorDelSelection();
+                        E.selection.active = 0;
+                        break;
+                    }
+                    if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+                    editorDelChar();
+                    break;
+        
+                case CTRL_KEY('l'):
+                case '\x1b':
+                    E.mode = NORMAL_MODE;
+                    break;
+        
+                default:
                     editorInsertChar(c);
                     break;
-                }
-    
-            case CTRL_KEY('c'):
-                if (E.selection.active) editorCopySelection();            
-                break;
-    
-            case CTRL_KEY('x'):
-                if (E.selection.active) editorCopySelection();
-                editorDelSelection();
-                break;
-    
-            case CTRL_KEY('v'):
-                editorPasteSelection();
-                break;
-    
-    
-            case BACKSPACE:
-            case CTRL_KEY('h'):
-            case DEL_KEY:
-                if (E.selection.active) {
-                    editorDelSelection();
-                    E.selection.active = 0;
-                    break;
-                }
-                if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-                editorDelChar();
-                break;
-    
-            case CTRL_KEY('l'):
-            case '\x1b':
-                E.mode = NORMAL_MODE;
-                break;
-    
-            default:
-                editorInsertChar(c);
-                break;
         }
     }
 
     finish:
+    if (c != '`' && E.match_insert) { free(E.match_insert); E.match_insert = NULL; }
     if (!isShiftKey(c)) E.selection.active = 0;
     quit_times = BABYVIM_QUIT_TIMES;
 }
@@ -1749,6 +1824,7 @@ void initEditor() {
 
     struct editorSelection selection = EDITOR_SELECTION_INIT;
     E.selection = selection;
+    E.match_insert = NULL;
     E.copyBuffer = NULL;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
